@@ -31,6 +31,18 @@ class ItemIn(BaseModel):
         return self
 
 
+def _find_duplicate_ids(items: list[ItemIn]) -> list[str]:
+    """返回器物列表中重复出现的编号（去重，按首次重复出现的顺序）。"""
+
+    seen: set[str] = set()
+    dup: list[str] = []
+    for it in items:
+        if it.item_id in seen and it.item_id not in dup:
+            dup.append(it.item_id)
+        seen.add(it.item_id)
+    return dup
+
+
 class PlanCreate(BaseModel):
     """排程请求。"""
 
@@ -39,12 +51,25 @@ class PlanCreate(BaseModel):
 
     @model_validator(mode="after")
     def _unique_ids(self):
-        seen: set[str] = set()
-        dup: list[str] = []
-        for it in self.items:
-            if it.item_id in seen and it.item_id not in dup:
-                dup.append(it.item_id)
-            seen.add(it.item_id)
+        dup = _find_duplicate_ids(self.items)
+        if dup:
+            raise ValueError(f"器物编号必须唯一，重复编号: {', '.join(dup)}")
+        return self
+
+
+class AppendItemsIn(BaseModel):
+    """追加器物请求。"""
+
+    items: list[ItemIn] = Field(
+        ...,
+        min_length=1,
+        max_length=14,
+        description="新器物（至少 1 件，编号不得与原方案重复）",
+    )
+
+    @model_validator(mode="after")
+    def _unique_ids(self):
+        dup = _find_duplicate_ids(self.items)
         if dup:
             raise ValueError(f"器物编号必须唯一，重复编号: {', '.join(dup)}")
         return self

@@ -10,6 +10,7 @@ from app.solver import (  # noqa: E402
     CapacityExceededError,
     TargetUnreachableError,
     Ware,
+    append_items,
     compare_kiln_assignments,
     min_capacity_for_target,
     select_within_kiln_limit,
@@ -550,6 +551,232 @@ def test_compare_random_brute_force():
         target_kilns = random_plan()
         result = compare_kiln_assignments(source_kilns, target_kilns)
         _check_compare_result(result, source_kilns, target_kilns)
+
+
+# ---------------------------------------------------------------------------
+# 追加器物 append_items
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_append(original_kilns, new_items, capacity):
+    """枚举每件新器物的去向（某一原窑或追加窑），返回 (新增窑次数, 方案元组)。
+
+    方案元组 = 原窑次序的合并编号元组 + 追加窑字典序最小方案（复用
+    _brute_force），与接口的整体字典序规则一致。
+    """
+    from itertools import product
+
+    ids = sorted(w.item_id for w in new_items)
+    by_id = {w.item_id: w for w in new_items}
+    m = len(original_kilns)
+    orig_sorted = [sorted(w.item_id for w in kiln) for kiln in original_kilns]
+    orig_vol = [sum(w.volume for w in kiln) for kiln in original_kilns]
+    orig_lo = [max(w.temp_low for w in kiln) for kiln in original_kilns]
+    orig_hi = [min(w.temp_high for w in kiln) for kiln in original_kilns]
+
+    def fits(j, members):
+        vol = orig_vol[j] + sum(by_id[i].volume for i in members)
+        if vol > capacity:
+            return False
+        lo = max([orig_lo[j]] + [by_id[i].temp_low for i in members])
+        hi = min([orig_hi[j]] + [by_id[i].temp_high for i in members])
+        return lo <= hi
+
+    best = None  # (新增窑次数, 方案元组)
+    for assignment in product(range(m + 1), repeat=len(ids)):
+        in_kiln = [[] for _ in range(m)]
+        appended = []
+        for item_id, dest in zip(ids, assignment):
+            if dest < m:
+                in_kiln[dest].append(item_id)
+            else:
+                appended.append(item_id)
+        if any(not fits(j, in_kiln[j]) for j in range(m)):
+            continue
+        if appended:
+            add_count, add_plan = _brute_force(
+                [by_id[i] for i in appended], capacity
+            )
+        else:
+            add_count, add_plan = 0, ()
+        plan = tuple(
+            tuple(sorted(orig_sorted[j] + in_kiln[j])) for j in range(m)
+        ) + add_plan
+        key = (add_count, plan)
+        if best is None or key < best:
+            best = key
+    return best
+
+
+def _check_append_result(kilns, original_kilns, new_items, capacity):
+    """校验结果的基本性质：原窑为前缀、原器物归属不变、各窑约束与温度正确。"""
+    m = len(original_kilns)
+    assert len(kilns) >= m
+    all_wares = {w.item_id: w for kiln in original_kilns for w in kiln}
+    all_wares.update({w.item_id: w for w in new_items})
+    for j, kiln_wares in enumerate(original_kilns):
+        assert {w.item_id for w in kiln_wares} <= set(kilns[j].item_ids)
+    for k in kilns:
+        assert list(k.item_ids) == sorted(k.item_ids)
+        assert k.total_volume == sum(all_wares[i].volume for i in k.item_ids)
+        assert k.total_volume <= capacity
+        assert k.firing_temp == max(all_wares[i].temp_low for i in k.item_ids)
+        assert k.firing_temp <= min(all_wares[i].temp_high for i in k.item_ids)
+
+
+def test_append_items_fills_original_kiln():
+    # p5 可填入窑 1（容量与温区交集均满足）-> 0 追加窑，烧成温度随之更新
+    original = [
+        [Ware("p1", 5, 100, 200)],
+        [Ware("p2", 6, 120, 220), Ware("p3", 4, 150, 300)],
+        [Ware("p4", 5, 1000, 1100)],
+    ]
+    kilns = append_items(original, [Ware("p5", 4, 150, 260)], 10)
+    assert [k.item_ids for k in kilns] == [("p1", "p5"), ("p2", "p3"), ("p4",)]
+    assert kilns[0].total_volume == 9
+    assert kilns[0].firing_temp == 150  # max(100, 150)
+    assert kilns[1].firing_temp == 150
+    assert kilns[2].firing_temp == 1000
+
+
+def test_append_items_appended_kiln():
+    # 新器物填不进任何原窑 -> 追加 1 窑，置于原窑之后
+    original = [[Ware("p1", 9, 100, 200)]]
+    kilns = append_items(original, [Ware("p5", 5, 100, 200)], 10)
+    assert [k.item_ids for k in kilns] == [("p1",), ("p5",)]
+    assert kilns[1].total_volume == 5
+    assert kilns[1].firing_temp == 100
+
+
+def test_append_items_appended_kilns_share():
+    # 两件新器物均填不进原窑，但彼此可同窑 -> 只追加 1 窑
+    original = [[Ware("x", 6, 100, 200)]]
+    new = [Ware("a", 5, 100, 200), Ware("b", 5, 100, 200)]
+    kilns = append_items(original, new, 10)
+    assert [k.item_ids for k in kilns] == [("x",), ("a", "b")]
+    assert kilns[1].total_volume == 10
+
+
+def test_append_items_prefers_fewer_appended_over_lex():
+    # 新增窑次最少优先于字典序：填入原窑使追加窑为 0
+    original = [[Ware("x", 5, 100, 200)]]
+    kilns = append_items(original, [Ware("a", 5, 100, 200)], 10)
+    assert [k.item_ids for k in kilns] == [("a", "x")]
+
+
+def test_append_items_lex_tiebreak():
+    # 追加 1 窑的三种方案并列：("a","b")("c") < ("b",)("a","c") < ("b","c")("a")
+    original = [[Ware("b", 5, 100, 200)]]
+    new = [Ware("a", 5, 100, 200), Ware("c", 5, 100, 200)]
+    kilns = append_items(original, new, 10)
+    assert [k.item_ids for k in kilns] == [("a", "b"), ("c",)]
+
+
+def test_append_items_temperature_intersection():
+    # a 与 x 温区相交可同窑（烧成温度升为 140）；b 与 x 温区不相交 -> 追加
+    original = [[Ware("x", 1, 100, 150)]]
+    new = [Ware("a", 1, 140, 200), Ware("b", 1, 160, 200)]
+    kilns = append_items(original, new, 10)
+    assert [k.item_ids for k in kilns] == [("a", "x"), ("b",)]
+    assert kilns[0].firing_temp == 140
+    assert kilns[1].firing_temp == 160
+
+
+def test_append_items_multiple_into_same_kiln():
+    # 同一原窑可填入多件新器物，按合并后的整体判定容量与温区
+    original = [[Ware("x", 2, 100, 300)]]
+    new = [Ware("a", 3, 120, 200), Ware("b", 4, 150, 250)]
+    kilns = append_items(original, new, 10)
+    assert [k.item_ids for k in kilns] == [("a", "b", "x")]
+    assert kilns[0].total_volume == 9
+    assert kilns[0].firing_temp == 150
+
+
+def test_append_items_oversized():
+    try:
+        append_items([[Ware("x", 5, 100, 200)]], [Ware("a", 11, 100, 200)], 10)
+        assert False, "应抛出 CapacityExceededError"
+    except CapacityExceededError:
+        pass
+
+
+def test_append_items_empty_rejected():
+    try:
+        append_items([[Ware("x", 5, 100, 200)]], [], 10)
+        assert False, "应抛出 ValueError"
+    except ValueError:
+        pass
+
+
+def test_append_items_count_limit():
+    # 原 13 件（13 窑）+ 新 2 件 = 15 件 -> 超限；+ 新 1 件 = 14 件可行
+    original = [[Ware(f"o{i:02d}", 1, 100, 200)] for i in range(13)]
+    try:
+        append_items(
+            original,
+            [Ware("n1", 1, 100, 200), Ware("n2", 1, 100, 200)],
+            100,
+        )
+        assert False, "应抛出 ValueError"
+    except ValueError:
+        pass
+    kilns = append_items(original, [Ware("n1", 1, 100, 200)], 100)
+    assert len(kilns) == 13
+    # "n1" < "o00"，填入首窑使整体字典序最小
+    assert kilns[0].item_ids == ("n1", "o00")
+
+
+def test_append_items_performance_n14():
+    # 原 1 件 + 新 13 件（合并 14 件），全兼容 -> 全部填入原窑，0 追加窑
+    import time
+
+    original = [[Ware("o0", 1, 1000, 2000)]]
+    new = [Ware(f"n{i:02d}", 1, 1000 + i, 2000) for i in range(13)]
+    t0 = time.time()
+    kilns = append_items(original, new, 100)
+    elapsed = time.time() - t0
+    assert elapsed < 5.0, f"合并 14 件耗时 {elapsed:.2f}s"
+    assert len(kilns) == 1
+    assert kilns[0].total_volume == 14
+    assert kilns[0].firing_temp == 1012
+
+
+def test_append_items_random_brute_force():
+    # 随机小规模用例：新增窑次数与整体方案同暴力枚举交叉验证
+    rng = random.Random(2025)
+    for trial in range(200):
+        n_orig = rng.randint(1, 4)
+        n_new = rng.randint(1, 4)
+        capacity = rng.randint(6, 12)
+        orig_items = []
+        for i in range(n_orig):
+            vol = rng.randint(1, 6)
+            lo = rng.randint(900, 1000)
+            hi = lo + rng.randint(0, 100)
+            orig_items.append(Ware(f"o{i}", vol, lo, hi))
+        new_items = []
+        for i in range(n_new):
+            vol = rng.randint(1, 6)
+            lo = rng.randint(900, 1000)
+            hi = lo + rng.randint(0, 100)
+            new_items.append(Ware(f"n{i}", vol, lo, hi))
+
+        by_id = {w.item_id: w for w in orig_items}
+        original_kilns = [
+            [by_id[i] for i in k.item_ids] for k in solve(orig_items, capacity)
+        ]
+
+        kilns = append_items(original_kilns, new_items, capacity)
+        got = (
+            len(kilns) - len(original_kilns),
+            tuple(k.item_ids for k in kilns),
+        )
+        exp = _brute_force_append(original_kilns, new_items, capacity)
+        assert got == exp, (
+            f"trial {trial}: {got} != {exp}, "
+            f"original={original_kilns}, new={new_items}, cap={capacity}"
+        )
+        _check_append_result(kilns, original_kilns, new_items, capacity)
 
 
 if __name__ == "__main__":

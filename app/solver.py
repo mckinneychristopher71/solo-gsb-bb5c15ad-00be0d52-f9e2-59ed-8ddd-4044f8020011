@@ -25,6 +25,11 @@
 器物数最大。权重 w[i][j] = 来源窑 i 与目标窑 j 的共同器物数，问题即
 二分图最大权匹配；用「按来源窑序 × 目标窑子集」的位掩码 DP 求最优值，
 再按「（来源序号、目标序号）配对序列字典序最小」贪心重建配对。
+
+追加器物（append_items）：原窑及其次序保持不变，新器物可填入剩余容量
+与温度区间交集均满足的原窑（同一原窑可填多件，按合并整体判定），或进入
+追加窑次。以后缀位掩码 DP 求新增窑次最少的全局方案，再按原窑次序贪心
+重建整体字典序最小者；剩余新器物的追加窑次复用 solve。
 """
 
 from __future__ import annotations
@@ -474,3 +479,189 @@ def compare_kiln_assignments(
         only_in_source_item_ids=tuple(only_in_source),
         only_in_target_item_ids=tuple(only_in_target),
     )
+
+
+def append_items(
+    original_kilns: Sequence[Sequence[Ware]],
+    new_items: list[Ware],
+    capacity: int,
+) -> list[Kiln]:
+    """在已保存方案上追加新器物，求新增窑次最少的装窑方案。
+
+    原窑及其次序保持不变；每件新器物可填入「剩余容量与温度区间交集均满足」
+    的原窑（同一原窑可填入多件，按合并后的整体判定），或进入追加窑次
+    （追加窑次与新建方案同规则：容量限制、温区交集、烧成温度取交集下界）。
+    全局选择新增窑次数最少的方案；并列时最终窑序为「原窑次序 + 追加窑
+    次序」，各窑编号升序，取整体字典序最小者。
+
+    记新器物 k 件、原窑 m 个；因合并后器物总数不超过 14 且每个原窑至少
+    一件原器物，必有 m + k ≤ 14。算法：
+
+      1. 枚举新器物的全部 2^k 个子集，递推总体积与温度交集；由此得到
+         「可单独成追加窑」标记与最少追加窑次 dp（同 solve 的子集表）。
+      2. 对每个原窑求可接纳的新器物子集（剩余容量 + 温区交集）。
+      3. 后缀 DP：best_from[j][mask] 表示用原窑 j..m-1 与追加窑安置
+         新器物集合 mask 所需的最少追加窑次；best_from[m] 即第 1 步的
+         dp，逐窑做子集 min 卷积回推，best_from[0][全集] 即全局最少
+         新增窑次。
+      4. 按原窑次序贪心重建：为每个原窑在「剩余器物仍可在最少追加窑次内
+         安置」的可接纳子集中，选合并后编号升序列表字典序最小者；剩余
+         新器物调用 solve 生成追加窑次（最少窑次 + 整体字典序最小）。
+
+    :param original_kilns: 原方案各窑的器物（按原窑次序）
+    :param new_items: 新器物（编号不得与原方案重复，至少 1 件）
+    :param capacity: 单窑容量（沿用原方案）
+    :raises CapacityExceededError: 新器物单件体积超过容量。
+    :raises ValueError: 新器物为空，或合并后器物总数超过 14 件。
+    """
+
+    k = len(new_items)
+    if k == 0:
+        raise ValueError("至少需要一件新器物")
+    n_orig = sum(len(kiln) for kiln in original_kilns)
+    if n_orig + k > 14:
+        raise ValueError(
+            f"合并后器物数量不得超过 14 件（原 {n_orig} 件 + 新 {k} 件）"
+        )
+
+    # 新器物按编号字典序升序排列；位 i 对应排序后的第 i 件。
+    ordered = sorted(new_items, key=lambda it: it.item_id)
+    ids = [it.item_id for it in ordered]
+
+    oversized = [it.item_id for it in ordered if it.volume > capacity]
+    if oversized:
+        raise CapacityExceededError(
+            f"以下器物单件体积超过单窑容量 {capacity}，无法烧成: "
+            + ", ".join(oversized)
+        )
+
+    size = 1 << k
+    full = size - 1
+
+    # ---- 1. 新器物子集的总体积、温度交集，与追加窑最少窑次 dp ----
+    mask_volume = [0] * size
+    mask_temp_low = [0] * size   # 交集下界（烧成温度）
+    mask_temp_high = [0] * size  # 交集上界
+    for mask in range(1, size):
+        bit = mask & -mask
+        i = bit.bit_length() - 1
+        prev = mask ^ bit
+        mask_volume[mask] = mask_volume[prev] + ordered[i].volume
+        if prev == 0:
+            mask_temp_low[mask] = ordered[i].temp_low
+            mask_temp_high[mask] = ordered[i].temp_high
+        else:
+            mask_temp_low[mask] = max(mask_temp_low[prev], ordered[i].temp_low)
+            mask_temp_high[mask] = min(mask_temp_high[prev], ordered[i].temp_high)
+
+    valid = bytearray(size)  # 可单独成追加窑的子集
+    for mask in range(1, size):
+        if (
+            mask_volume[mask] <= capacity
+            and mask_temp_low[mask] <= mask_temp_high[mask]
+        ):
+            valid[mask] = 1
+
+    dp = [k + 1] * size  # dp[mask]：mask 全部进追加窑的最少窑次
+    dp[0] = 0
+    for mask in range(1, size):
+        best = dp[mask]
+        sub = mask
+        while sub:
+            if valid[sub]:
+                candidate = dp[mask ^ sub] + 1
+                if candidate < best:
+                    best = candidate
+            sub = (sub - 1) & mask
+        dp[mask] = best
+
+    # ---- 2. 每个原窑可接纳的新器物子集 ----
+    m = len(original_kilns)
+    kiln_sorted_ids: list[list[str]] = []  # 原窑原器物编号（升序）
+    kiln_volume: list[int] = []            # 原窑已用体积
+    kiln_temp_low: list[int] = []          # 原窑温区交集下界
+    feasible: list[bytearray] = []         # feasible[j][s]：子集 s 可填入原窑 j
+    for kiln in original_kilns:
+        used = sum(w.volume for w in kiln)
+        low = max(w.temp_low for w in kiln)
+        high = min(w.temp_high for w in kiln)
+        kiln_sorted_ids.append(sorted(w.item_id for w in kiln))
+        kiln_volume.append(used)
+        kiln_temp_low.append(low)
+        fj = bytearray(size)
+        fj[0] = 1  # 空子集恒可填入（原窑保持不变）
+        for mask in range(1, size):
+            if (
+                mask_volume[mask] <= capacity - used
+                and max(low, mask_temp_low[mask])
+                <= min(high, mask_temp_high[mask])
+            ):
+                fj[mask] = 1
+        feasible.append(fj)
+
+    # ---- 3. 后缀 DP：最少追加窑次 ----
+    # best_from[j][mask]：用原窑 j..m-1 与追加窑安置 mask 的最少追加窑次
+    best_from: list[list[int]] = [[]] * (m + 1)
+    best_from[m] = dp
+    for j in range(m - 1, -1, -1):
+        nxt = best_from[j + 1]
+        fj = feasible[j]
+        cur = [0] * size
+        for mask in range(size):
+            best = nxt[mask]  # 原窑 j 不填入任何新器物
+            sub = mask
+            while sub:
+                if fj[sub]:
+                    candidate = nxt[mask ^ sub]
+                    if candidate < best:
+                        best = candidate
+                sub = (sub - 1) & mask
+            cur[mask] = best
+        best_from[j] = cur
+
+    min_appended = best_from[0][full]
+
+    # ---- 4. 按原窑次序贪心重建整体字典序最小方案 ----
+    # 不变式：进入原窑 j 时 best_from[j][rem] == min_appended，
+    # 故空子集恒为可行候选，循环必能选出子集。
+    rem = full
+    kilns: list[Kiln] = []
+    for j in range(m):
+        fj = feasible[j]
+        nxt = best_from[j + 1]
+        orig = kiln_sorted_ids[j]
+        best_sub = 0
+        best_tuple: tuple[str, ...] | None = None
+        sub = rem
+        while True:
+            if fj[sub] and nxt[rem ^ sub] <= min_appended:
+                merged = tuple(
+                    sorted(orig + [ids[i] for i in range(k) if (sub >> i) & 1])
+                )
+                if best_tuple is None or merged < best_tuple:
+                    best_tuple = merged
+                    best_sub = sub
+            if sub == 0:
+                break
+            sub = (sub - 1) & rem
+
+        assert best_tuple is not None
+        firing_temp = kiln_temp_low[j]
+        if best_sub:
+            firing_temp = max(firing_temp, mask_temp_low[best_sub])
+        kilns.append(
+            Kiln(
+                item_ids=best_tuple,
+                total_volume=kiln_volume[j] + mask_volume[best_sub],
+                firing_temp=firing_temp,
+            )
+        )
+        rem ^= best_sub
+
+    # ---- 剩余新器物进入追加窑次：复用 solve（最少窑次 + 字典序最小） ----
+    if rem:
+        kilns.extend(
+            solve([ordered[i] for i in range(k) if (rem >> i) & 1], capacity)
+        )
+
+    return kilns
