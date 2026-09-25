@@ -3,6 +3,7 @@
 POST /plans                              提交器物与容量，求解、保存并返回方案
 POST /plans/compare                      比较两份已保存方案的窑次对应关系
 GET  /plans/{plan_id}                    按 ID 读取已保存方案
+POST /plans/{plan_id}/append-items       在已保存方案上追加器物，生成并保存新方案
 POST /plans/{plan_id}/capacity-target    求使最少窑次不超过目标的最小单窑容量
 POST /plans/{plan_id}/production-limit   限窑次接单：在最多 max_kilns 窑内择优保留器物
 GET  /health                             健康检查
@@ -18,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 from . import database
 from .schemas import (
+    AppendItemsIn,
     CapacityTargetIn,
     CapacityTargetOut,
     ErrorOut,
@@ -34,6 +36,7 @@ from .solver import (
     CapacityExceededError,
     TargetUnreachableError,
     Ware,
+    append_to_plan,
     compare_kiln_assignments,
     min_capacity_for_target,
     select_within_kiln_limit,
@@ -183,6 +186,113 @@ def read_plan(plan_id: str) -> PlanOut:
             },
         )
     return PlanOut(**plan)
+
+
+@app.post(
+    "/plans/{plan_id}/append-items",
+    response_model=PlanOut,
+    status_code=201,
+    tags=["plans"],
+    responses={
+        400: {"model": ErrorOut, "description": "编号与原方案重复、合并后超过 14 件或单件超容量"},
+        404: {"model": ErrorOut, "description": "方案不存在"},
+    },
+    summary="在已保存方案上追加器物（新增窑次最少，原方案不改写）",
+)
+def append_items(plan_id: str, payload: AppendItemsIn) -> PlanOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    existing_ids = {it["item_id"] for it in plan["items"]}
+    conflicts = [
+        it.item_id for it in payload.items if it.item_id in existing_ids
+    ]
+    if conflicts:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "ITEM_ID_CONFLICT",
+                "message": (
+                    "新器物编号不得与原方案重复，冲突编号: " + ", ".join(conflicts)
+                ),
+            },
+        )
+
+    merged_count = plan["item_count"] + len(payload.items)
+    if merged_count > 14:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "ITEM_COUNT_EXCEEDED",
+                "message": (
+                    f"合并后器物数 {merged_count} 超过上限 14: "
+                    f"原方案共 {plan['item_count']} 件，"
+                    f"本次追加 {len(payload.items)} 件"
+                ),
+            },
+        )
+
+    # 沿用原方案的单窑容量与全部器物的体积/温区；原器物及原窑次序保持不变。
+    all_items = [
+        Ware(
+            item_id=it["item_id"],
+            volume=it["volume"],
+            temp_low=it["temp_low"],
+            temp_high=it["temp_high"],
+        )
+        for it in plan["items"]
+    ]
+    all_items.extend(
+        Ware(
+            item_id=it.item_id,
+            volume=it.volume,
+            temp_low=it.temp_low,
+            temp_high=it.temp_high,
+        )
+        for it in payload.items
+    )
+
+    existing_kilns = [
+        list(k["item_ids"]) for k in sorted(plan["kilns"], key=lambda k: k["index"])
+    ]
+
+    # 单件超容量时 solver 抛出 CapacityExceededError，由全局处理器返回 400。
+    kilns = append_to_plan(
+        existing_kilns,
+        all_items,
+        [it.item_id for it in payload.items],
+        plan["capacity"],
+    )
+
+    new_plan = {
+        "id": uuid.uuid4().hex,
+        "capacity": plan["capacity"],
+        "item_count": merged_count,
+        "kiln_count": len(kilns),
+        "items": [it for it in plan["items"]]
+        + [it.model_dump() for it in payload.items],
+        "kilns": [
+            {
+                "index": idx,
+                "item_ids": list(k.item_ids),
+                "total_volume": k.total_volume,
+                "firing_temp": k.firing_temp,
+            }
+            for idx, k in enumerate(kilns, start=1)
+        ],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # 结果作为新方案保存；原方案保持不变。
+    database.save_plan(new_plan)
+    return PlanOut(**new_plan)
 
 
 @app.post(

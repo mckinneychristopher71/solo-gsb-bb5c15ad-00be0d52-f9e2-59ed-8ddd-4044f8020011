@@ -20,6 +20,14 @@
 保留总体积最大 → 保留编号升序列表字典序最小」择优；选中器物的装窑
 仍调用 solve，沿用最少窑次与字典序排序。
 
+已保存方案追加器物（append_to_plan）：原有器物与原窑次序固定不变，
+每件新器物可并入某个仍有余量且温区相交的原窑，或进入追加窑次。
+先枚举新器物的可并入子集（逐原窑：体积不超余量、温区与原窑区间相交），
+再用「原窑序 × 新器物位掩码」DP 求最少追加窑次（f[j][mask] =
+并入 j..m-1 号原窑后剩余新器物的最少窑次 = 新器物子集的 dp），
+并按「原窑合并后编号列表 + 追加窑次列表」的整体字典序贪心重建；
+追加窑次本身的装窑直接复用 solve（最少窑次、字典序最小）。
+
 方案对比（compare_kiln_assignments）：以共同器物编号为范围，把来源与
 目标窑次一对一配对（配对数取两边窑次数较小值），使留在对应窑中的共同
 器物数最大。权重 w[i][j] = 来源窑 i 与目标窑 j 的共同器物数，问题即
@@ -89,7 +97,8 @@ class _Tables:
     n: int
     ids: list[str]
     mask_volume: list[int]
-    mask_temp_low: list[int]  # 交集下界（烧成温度）
+    mask_temp_low: list[int]   # 交集下界（烧成温度）
+    mask_temp_high: list[int]  # 交集上界
     valid: bytearray
     dp: list[int]
 
@@ -168,7 +177,7 @@ def _build_tables(items: list[Ware], capacity: int) -> _Tables:
             sub = (sub - 1) & mask
         dp[mask] = best
 
-    return _Tables(n, ids, mask_volume, mask_temp_low, valid, dp)
+    return _Tables(n, ids, mask_volume, mask_temp_low, mask_temp_high, valid, dp)
 
 
 def solve(items: list[Ware], capacity: int) -> list[Kiln]:
@@ -227,6 +236,151 @@ def solve(items: list[Ware], capacity: int) -> list[Kiln]:
         )
         left ^= best_group
         allowed_kilns -= 1
+
+    return kilns
+
+
+def append_to_plan(
+    existing_kilns: Sequence[Sequence[str]],
+    all_items: Sequence[Ware],
+    new_item_ids: Sequence[str],
+    capacity: int,
+) -> list[Kiln]:
+    """在保持原方案器物与原窑次序不变的前提下，把新器物并入方案。
+
+    每件新器物可：
+      * 并入某个原窑——并入后该窑总体积不超过 ``capacity``，且新器物
+        与窑内全部器物的温度区间存在公共交集；
+      * 或进入追加窑次（原窑之后新建的窑），同窑规则与 solve 一致。
+
+    全局最优：先令**追加窑次数最少**；并列时按「原窑次序的各窑升序编号
+    列表 + 追加窑次序的各窑升序编号列表」取整体字典序最小者。
+    烧成温度取窑内温区交集下界。原器物在原窑内的相对次序、原窑之间的
+    次序均保持不变（窑内新编号按字符串字典序插入升序位置）。
+
+    :param existing_kilns: 原方案各窑的器物编号（列表顺序即原窑次序）
+    :param all_items: 原方案器物与新器物的完整列表
+    :param new_item_ids: 本次追加的新器物编号（与原方案编号互不重复）
+    :param capacity: 沿用原方案的单窑容量
+    :returns: 合并后的装窑明细（原窑在前、追加窑在后）。
+    :raises CapacityExceededError: 存在单件体积超过容量的新器物。
+    :raises ValueError: 新器物为空、合并后超过 14 件，或编号非法。
+    """
+
+    k = len(new_item_ids)
+    if k == 0:
+        raise ValueError("至少需要一件新器物")
+    if len(existing_kilns) + k > 14 or len(all_items) > 14:
+        raise ValueError("合并后器物数量不得超过 14 件")
+
+    by_id = {it.item_id: it for it in all_items}
+    if any(nid not in by_id for nid in new_item_ids) or len(by_id) != len(all_items):
+        raise ValueError("器物编号必须唯一")
+    existing_ids = {x for group in existing_kilns for x in group}
+    if any(nid in existing_ids for nid in new_item_ids):
+        raise ValueError("新器物编号不得与原方案器物重复")
+    for group in existing_kilns:
+        if not group:
+            raise ValueError("原方案的窑次不得为空")
+
+    # ---- 新器物子集表与最少窑次 dp（位 i 对应编号升序后的第 i 件新器物） ----
+    new_wares = [by_id[nid] for nid in new_item_ids]
+    tables = _build_tables(list(new_wares), capacity)
+    size = 1 << k
+    dp = tables.dp
+
+    # ---- 每个原窑可并入的新器物子集 ----
+    # addable[j][mask] = 1 表示 mask 可并入第 j 个原窑：
+    # 并入后总体积不超容量，且温区与原窑区间（lo_j, hi_j）仍有交集。
+    m = len(existing_kilns)
+    addable: list[bytearray] = []
+    for group in existing_kilns:
+        members = [by_id[x] for x in group]
+        used_volume = sum(w.volume for w in members)
+        kiln_low = max(w.temp_low for w in members)
+        kiln_high = min(w.temp_high for w in members)
+        row = bytearray(size)
+        for mask in range(1, size):
+            if (
+                used_volume + tables.mask_volume[mask] <= capacity
+                and max(tables.mask_temp_low[mask], kiln_low)
+                <= min(tables.mask_temp_high[mask], kiln_high)
+            ):
+                row[mask] = 1
+        addable.append(row)
+
+    # ---- f[j][mask]：第 j..m-1 号原窑处理完、仍未并入（即 mask）的
+    #      新器物，最少需要多少追加窑次；并入方案不影响该值，仅取决于 mask。 ----
+    INF = k + 1
+    f: list[bytearray] = [bytearray() for _ in range(m + 1)]
+    f[m] = bytearray(dp)
+    for j in range(m - 1, -1, -1):
+        cur = bytearray([INF]) * size
+        nxt = f[j + 1]
+        row = addable[j]
+        for mask in range(size):
+            best = nxt[mask]  # 新器物不并入原窑 j
+            sub = mask
+            while sub:
+                if row[sub]:
+                    cand = nxt[mask ^ sub]
+                    if cand < best:
+                        best = cand
+                sub = (sub - 1) & mask
+            cur[mask] = best
+        f[j] = cur
+
+    # ---- 贪心重建：逐原窑取「最优可达且合并后编号序列字典序最小」的并入
+    #      子集。追加窑次排在所有原窑之后，原窑序列前缀较小者整体必较小，
+    #      故在最少追加窑次约束下只需按原窑前缀字典序贪心；注意比较的是
+    #      「原窑成员 ∪ 并入新器物」合并后的完整元组（不并入时原窑保持
+    #      原样，可能比并入任何新编号都小）。 ----
+    remaining = size - 1
+    insert_masks: list[int] = [0] * m
+    for j in range(m):
+        nxt = f[j + 1]
+        row = addable[j]
+        original_members = tuple(sorted(existing_kilns[j]))
+        best_tuple: tuple[str, ...] | None = None
+        best_sub = -1
+        sub = remaining
+        while True:
+            if (sub == 0 or row[sub]) and nxt[remaining ^ sub] == f[j][remaining]:
+                members = tuple(sorted(
+                    original_members
+                    + tuple(tables.ids[i] for i in range(k) if (sub >> i) & 1)
+                ))
+                if best_tuple is None or members < best_tuple:
+                    best_tuple = members
+                    best_sub = sub
+            if sub == 0:
+                break
+            sub = (sub - 1) & remaining
+        assert best_sub >= 0
+        insert_masks[j] = best_sub
+        remaining ^= best_sub
+
+    # ---- 合并后的原窑（原器物不动，新编号按升序插入）；best_tuple 已排序 ----
+    kilns: list[Kiln] = []
+    for j, group in enumerate(existing_kilns):
+        ins = insert_masks[j]
+        inserted = [tables.ids[i] for i in range(k) if (ins >> i) & 1]
+        members = tuple(sorted((*group, *inserted)))
+        member_wares = [by_id[x] for x in members]
+        kilns.append(
+            Kiln(
+                item_ids=members,
+                total_volume=sum(w.volume for w in member_wares),
+                firing_temp=max(w.temp_low for w in member_wares),
+            )
+        )
+
+    # ---- 剩余新器物进入追加窑次：装窑完全复用 solve（最少窑次、字典序最小） ----
+    if remaining:
+        leftover_ids = tuple(
+            tables.ids[i] for i in range(k) if (remaining >> i) & 1
+        )
+        kilns.extend(solve([by_id[x] for x in leftover_ids], capacity))
 
     return kilns
 

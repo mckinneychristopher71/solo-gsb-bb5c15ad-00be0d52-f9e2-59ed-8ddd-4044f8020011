@@ -31,6 +31,19 @@ class ItemIn(BaseModel):
         return self
 
 
+def _check_unique_item_ids(items: list["ItemIn"]) -> None:
+    """校验一批器物编号互不重复，重复时抛出 ValueError。"""
+
+    seen: set[str] = set()
+    dup: list[str] = []
+    for it in items:
+        if it.item_id in seen and it.item_id not in dup:
+            dup.append(it.item_id)
+        seen.add(it.item_id)
+    if dup:
+        raise ValueError(f"器物编号必须唯一，重复编号: {', '.join(dup)}")
+
+
 class PlanCreate(BaseModel):
     """排程请求。"""
 
@@ -39,19 +52,23 @@ class PlanCreate(BaseModel):
 
     @model_validator(mode="after")
     def _unique_ids(self):
-        seen: set[str] = set()
-        dup: list[str] = []
-        for it in self.items:
-            if it.item_id in seen and it.item_id not in dup:
-                dup.append(it.item_id)
-            seen.add(it.item_id)
-        if dup:
-            raise ValueError(f"器物编号必须唯一，重复编号: {', '.join(dup)}")
+        _check_unique_item_ids(self.items)
         return self
 
 
 class ItemOut(ItemIn):
     pass
+
+
+class AppendItemsIn(BaseModel):
+    """已保存方案追加器物请求（编号不得与原方案重复，合并后不超过 14 件）。"""
+
+    items: list[ItemIn] = Field(..., min_length=1, max_length=14)
+
+    @model_validator(mode="after")
+    def _unique_ids(self):
+        _check_unique_item_ids(self.items)
+        return self
 
 
 class KilnOut(BaseModel):
